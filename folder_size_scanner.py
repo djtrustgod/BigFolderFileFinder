@@ -544,14 +544,14 @@ class ScannerApp(ctk.CTk):
         self._files_tree = self._build_tree(
             files_tab,
             ["#", "File Name", "Extension", "Size on Disk",
-             "Size on Disk (MB)", "Modified", "Relative Path"],
-            [40, 260, 80, 110, 130, 140, 420],
+             "Modified", "Relative Path"],
+            [50, 280, 90, 130, 160, 500],
         )
         self._folders_tree = self._build_tree(
             folders_tab,
             ["#", "Folder Name", "Size on Disk",
-             "Size on Disk (MB)", "Modified", "Relative Path"],
-            [40, 300, 110, 130, 140, 420],
+             "Modified", "Relative Path"],
+            [50, 320, 130, 160, 500],
         )
         self._log_text = self._build_log(log_tab)
 
@@ -568,7 +568,7 @@ class ScannerApp(ctk.CTk):
         for col, w in zip(columns, col_widths):
             tree.heading(col, text=col,
                          command=lambda c=col, t=tree: self._sort_tree(t, c, False))
-            anchor = "e" if col in ("Size on Disk (MB)", "#") else "w"
+            anchor = "center" if col == "#" else "w"
             tree.column(col, width=w, anchor=anchor, minwidth=30)
 
         vsb = ctk.CTkScrollbar(container, command=tree.yview)
@@ -624,13 +624,13 @@ class ScannerApp(ctk.CTk):
             pass
         style.configure(
             "Custom.Treeview",
-            font=("Segoe UI", 10), rowheight=24,
+            font=("Segoe UI", 12), rowheight=30,
             background=p["bg"], fieldbackground=p["field_bg"],
             foreground=p["fg"], borderwidth=0,
         )
         style.configure(
             "Custom.Treeview.Heading",
-            font=("Segoe UI", 10, "bold"),
+            font=("Segoe UI", 12, "bold"),
             background=p["heading_bg"], foreground=p["heading_fg"],
             relief="flat",
         )
@@ -679,7 +679,7 @@ class ScannerApp(ctk.CTk):
             return
         tree.selection_set(iid)
         tree.focus(iid)
-        menu = tk.Menu(self, tearoff=0)
+        menu = tk.Menu(self, tearoff=0, font=("Segoe UI", 11))
         menu.add_command(label="Show in Explorer",
                          command=lambda: self._reveal_selected(tree))
         menu.add_command(label="Open Containing Folder",
@@ -810,7 +810,7 @@ class ScannerApp(ctk.CTk):
             tag = "even" if i % 2 == 0 else "odd"
             iid = self._files_tree.insert("", "end", tags=(tag,), values=(
                 i + 1, f["name"], f["extension"],
-                f["size_human"], f"{f['size_mb']:.3f}",
+                f["size_human"],
                 f["modified"], f["relative_path"],
             ))
             self._file_paths[iid] = f["full_path"]
@@ -819,7 +819,7 @@ class ScannerApp(ctk.CTk):
             tag = "even" if i % 2 == 0 else "odd"
             iid = self._folders_tree.insert("", "end", tags=(tag,), values=(
                 i + 1, f["name"],
-                f["size_human"], f"{f['size_mb']:.3f}",
+                f["size_human"],
                 f["modified"], f["relative_path"],
             ))
             self._folder_paths[iid] = f["full_path"]
