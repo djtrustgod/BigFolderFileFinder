@@ -3,6 +3,8 @@ Folder Size Scanner
 A GUI utility to find large files and folders and export them to Excel.
 """
 
+import ctypes
+import ctypes.wintypes
 import os
 import platform
 import subprocess
@@ -13,21 +15,22 @@ from tkinter import ttk, filedialog, messagebox
 from datetime import datetime
 from pathlib import Path
 
-try:
-    import openpyxl
-    from openpyxl import Workbook
-    from openpyxl.styles import (
-        Font, PatternFill, Alignment, Border, Side, GradientFill
-    )
-    from openpyxl.utils import get_column_letter
-    from openpyxl.formatting.rule import ColorScaleRule
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "openpyxl", "-q"])
-    import openpyxl
-    from openpyxl import Workbook
-    from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
-    from openpyxl.utils import get_column_letter
-    from openpyxl.formatting.rule import ColorScaleRule
+def _ensure_package(module_name, pip_name=None):
+    try:
+        return __import__(module_name)
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", pip_name or module_name, "-q"])
+        return __import__(module_name)
+
+
+_ensure_package("openpyxl")
+_ensure_package("customtkinter")
+
+from openpyxl import Workbook
+from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
+from openpyxl.utils import get_column_letter
+from openpyxl.formatting.rule import ColorScaleRule
+import customtkinter as ctk
 
 
 # ─────────────────────────────────────────────
@@ -41,7 +44,7 @@ def get_folder_size(folder_path):
         for entry in os.scandir(folder_path):
             try:
                 if entry.is_file(follow_symlinks=False):
-                    total += entry.stat(follow_symlinks=False).st_size
+                    total += get_disk_size(entry.path)
                 elif entry.is_dir(follow_symlinks=False):
                     total += get_folder_size(entry.path)
             except (PermissionError, OSError):
@@ -63,6 +66,21 @@ def bytes_to_human(b):
     if b >= 1024:
         return f"{b / 1024:.2f} KB"
     return f"{b} B"
+
+
+def get_disk_size(file_path):
+    """Return actual bytes allocated on disk, matching Windows Explorer's 'Size on Disk'.
+    Handles cloud placeholders (OneDrive), NTFS-compressed, and sparse files.
+    Falls back to logical size on non-Windows or on API error."""
+    if platform.system() != "Windows":
+        return os.path.getsize(file_path)
+    high = ctypes.wintypes.DWORD(0)
+    low = ctypes.windll.kernel32.GetCompressedFileSizeW(
+        ctypes.c_wchar_p(file_path), ctypes.byref(high)
+    )
+    if low == 0xFFFFFFFF and ctypes.GetLastError() != 0:
+        return os.path.getsize(file_path)
+    return (high.value << 32) | low
 
 
 def get_modified_date(path):
@@ -96,7 +114,7 @@ def scan_directory(root_path, threshold_mb, progress_callback, stop_event):
                 break
             fpath = os.path.join(dirpath, fname)
             try:
-                size = os.path.getsize(fpath)
+                size = get_disk_size(fpath)
                 if size >= threshold_bytes:
                     rel = os.path.relpath(fpath, root_path)
                     ext = Path(fpath).suffix.lower() or "(no ext)"
@@ -252,7 +270,7 @@ def build_files_sheet(ws, large_files, threshold_mb):
     t.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 26
 
-    headers = ["#", "File Name", "Extension", "Size", "Size (MB)", "Modified Date", "Relative Path", "Parent Folder"]
+    headers = ["#", "File Name", "Extension", "Size on Disk", "Size on Disk (MB)", "Modified Date", "Relative Path", "Parent Folder"]
     apply_header_row(ws, 2, headers, FILE_HDR_FILL)
 
     for i, f in enumerate(large_files, 1):
@@ -314,7 +332,7 @@ def build_folders_sheet(ws, large_folders, threshold_mb):
     t.alignment = Alignment(horizontal="center", vertical="center")
     ws.row_dimensions[1].height = 26
 
-    headers = ["#", "Folder Name", "Size", "Size (MB)", "Modified Date", "Relative Path", "Parent Folder"]
+    headers = ["#", "Folder Name", "Size on Disk", "Size on Disk (MB)", "Modified Date", "Relative Path", "Parent Folder"]
     apply_header_row(ws, 2, headers, FOLD_HDR_FILL)
 
     for i, f in enumerate(large_folders, 1):
@@ -383,173 +401,254 @@ def export_to_excel(root_path, threshold_mb, large_files, large_folders, scan_ti
 #  GUI
 # ─────────────────────────────────────────────
 
-class ScannerApp(tk.Tk):
+# Treeview palette per appearance mode (ttk doesn't auto-follow customtkinter themes)
+TREE_PALETTE = {
+    "Light": {
+        "bg": "#FFFFFF", "fg": "#1F3864", "field_bg": "#FFFFFF",
+        "heading_bg": "#1F538D", "heading_fg": "#FFFFFF",
+        "selected_bg": "#3B8ED0", "selected_fg": "#FFFFFF",
+        "odd": "#FFFFFF", "even": "#EBF3FB",
+    },
+    "Dark": {
+        "bg": "#2B2B2B", "fg": "#DCE4EE", "field_bg": "#2B2B2B",
+        "heading_bg": "#1F538D", "heading_fg": "#FFFFFF",
+        "selected_bg": "#14375E", "selected_fg": "#FFFFFF",
+        "odd": "#2B2B2B", "even": "#333333",
+    },
+}
+
+
+class ScannerApp(ctk.CTk):
     def __init__(self):
         super().__init__()
+        ctk.set_appearance_mode("system")
+        ctk.set_default_color_theme("blue")
+
         self.title("Folder Size Scanner")
-        self.geometry("960x680")
-        self.minsize(800, 550)
-        self.configure(bg="#F0F4F8")
+        self.geometry("1060x720")
+        self.minsize(880, 580)
 
         self._large_files = []
         self._large_folders = []
         self._scan_time = 0.0
         self._stop_event = threading.Event()
         self._scanning = False
+        self._file_paths = {}     # tree iid -> full path (Large Files tab)
+        self._folder_paths = {}   # tree iid -> full path (Large Folders tab)
 
-        self._build_ui()
+        self.grid_rowconfigure(2, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self._build_header()
+        self._build_controls()
+        self._build_tabs()
+        self._build_progress()
+        self._build_statusbar()
+
+        self._apply_tree_theme()
 
     # ── UI construction ──────────────────────
 
-    def _build_ui(self):
-        # ── Top control panel ──
-        ctrl = tk.Frame(self, bg="#1F3864", pady=12, padx=16)
-        ctrl.pack(fill="x")
+    def _build_header(self):
+        header = ctk.CTkFrame(self, corner_radius=0, height=64,
+                              fg_color=("#1F3864", "#111827"))
+        header.grid(row=0, column=0, sticky="ew")
+        header.grid_columnconfigure(1, weight=1)
 
-        tk.Label(ctrl, text="🔍 Folder Size Scanner",
-                 font=("Arial", 16, "bold"), bg="#1F3864", fg="white").grid(
-            row=0, column=0, columnspan=6, sticky="w", pady=(0, 8))
+        ctk.CTkLabel(
+            header, text="🔍  Folder Size Scanner",
+            font=ctk.CTkFont(family="Segoe UI", size=18, weight="bold"),
+            text_color="white",
+        ).grid(row=0, column=0, padx=20, pady=14, sticky="w")
 
-        # Folder picker
-        tk.Label(ctrl, text="Folder:", font=("Arial", 10, "bold"),
-                 bg="#1F3864", fg="#BDD7EE").grid(row=1, column=0, sticky="w", padx=(0, 6))
+        right = ctk.CTkFrame(header, fg_color="transparent")
+        right.grid(row=0, column=2, padx=16, pady=10, sticky="e")
+
+        ctk.CTkLabel(
+            right, text="Theme:", font=ctk.CTkFont(size=12),
+            text_color="white",
+        ).pack(side="left", padx=(0, 8))
+
+        self._theme_switch = ctk.CTkSegmentedButton(
+            right, values=["Light", "Dark", "System"],
+            command=self._on_theme_change,
+        )
+        self._theme_switch.set("System")
+        self._theme_switch.pack(side="left")
+
+    def _build_controls(self):
+        ctrl = ctk.CTkFrame(self, corner_radius=0)
+        ctrl.grid(row=1, column=0, sticky="ew")
+        ctrl.grid_columnconfigure(1, weight=1)
+
+        ctk.CTkLabel(ctrl, text="Folder:",
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=0, column=0, padx=(16, 6), pady=12, sticky="w")
+
         self._folder_var = tk.StringVar()
-        self._folder_entry = tk.Entry(ctrl, textvariable=self._folder_var,
-                                      font=("Arial", 10), width=52,
-                                      relief="flat", bd=1)
-        self._folder_entry.grid(row=1, column=1, sticky="ew", padx=(0, 6))
-        tk.Button(ctrl, text="Browse…", command=self._browse_folder,
-                  font=("Arial", 10), bg="#2E75B6", fg="white",
-                  relief="flat", padx=10, cursor="hand2").grid(row=1, column=2, padx=(0, 20))
+        ctk.CTkEntry(
+            ctrl, textvariable=self._folder_var,
+            placeholder_text="Choose a folder to scan…",
+            font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=1, padx=(0, 6), pady=12, sticky="ew")
 
-        # Threshold
-        tk.Label(ctrl, text="Min size:", font=("Arial", 10, "bold"),
-                 bg="#1F3864", fg="#BDD7EE").grid(row=1, column=3, sticky="w", padx=(0, 6))
+        ctk.CTkButton(
+            ctrl, text="Browse…", width=90, command=self._browse_folder,
+        ).grid(row=0, column=2, padx=(0, 24), pady=12)
+
+        ctk.CTkLabel(ctrl, text="Min size:",
+                     font=ctk.CTkFont(size=12, weight="bold")).grid(
+            row=0, column=3, padx=(0, 6), pady=12, sticky="w")
+
         self._threshold_var = tk.StringVar(value="100")
-        tk.Entry(ctrl, textvariable=self._threshold_var,
-                 font=("Arial", 10), width=8,
-                 relief="flat", bd=1).grid(row=1, column=4, padx=(0, 4))
-        tk.Label(ctrl, text="MB", font=("Arial", 10, "bold"),
-                 bg="#1F3864", fg="#BDD7EE").grid(row=1, column=5, padx=(0, 16))
+        ctk.CTkEntry(
+            ctrl, textvariable=self._threshold_var, width=70,
+            font=ctk.CTkFont(size=12),
+        ).grid(row=0, column=4, padx=(0, 4), pady=12)
 
-        # Scan / Stop / Export buttons
-        btn_frame = tk.Frame(ctrl, bg="#1F3864")
-        btn_frame.grid(row=1, column=6, padx=(8, 0))
+        ctk.CTkLabel(ctrl, text="MB",
+                     font=ctk.CTkFont(size=12)).grid(
+            row=0, column=5, padx=(0, 20), pady=12)
 
-        self._scan_btn = tk.Button(btn_frame, text="▶  Scan", command=self._start_scan,
-                                   font=("Arial", 10, "bold"), bg="#70AD47", fg="white",
-                                   relief="flat", padx=14, pady=4, cursor="hand2")
+        btn_frame = ctk.CTkFrame(ctrl, fg_color="transparent")
+        btn_frame.grid(row=0, column=6, padx=(0, 16), pady=12)
+
+        self._scan_btn = ctk.CTkButton(
+            btn_frame, text="▶  Scan", width=100,
+            fg_color="#2E8B57", hover_color="#246B44",
+            command=self._start_scan,
+        )
         self._scan_btn.pack(side="left", padx=(0, 6))
 
-        self._stop_btn = tk.Button(btn_frame, text="⏹ Stop", command=self._stop_scan,
-                                   font=("Arial", 10), bg="#C55A11", fg="white",
-                                   relief="flat", padx=10, pady=4, cursor="hand2",
-                                   state="disabled")
+        self._stop_btn = ctk.CTkButton(
+            btn_frame, text="⏹  Stop", width=90,
+            fg_color="#B55419", hover_color="#8B3F11",
+            state="disabled", command=self._stop_scan,
+        )
         self._stop_btn.pack(side="left", padx=(0, 6))
 
-        self._export_btn = tk.Button(btn_frame, text="📥 Export to Excel",
-                                     command=self._export_excel,
-                                     font=("Arial", 10, "bold"), bg="#1F4E79", fg="white",
-                                     relief="flat", padx=14, pady=4, cursor="hand2",
-                                     state="disabled")
+        self._export_btn = ctk.CTkButton(
+            btn_frame, text="📥  Export to Excel", width=170,
+            state="disabled", command=self._export_excel,
+        )
         self._export_btn.pack(side="left")
 
-        ctrl.columnconfigure(1, weight=1)
+    def _build_tabs(self):
+        self._tabs = ctk.CTkTabview(self, corner_radius=8)
+        self._tabs.grid(row=2, column=0, sticky="nsew", padx=12, pady=(8, 4))
 
-        # ── Status bar ──
-        self._status_var = tk.StringVar(value="Ready — choose a folder and click Scan.")
-        status_bar = tk.Frame(self, bg="#DDE8F0", pady=4, padx=10)
-        status_bar.pack(fill="x")
-        tk.Label(status_bar, textvariable=self._status_var,
-                 font=("Arial", 9), bg="#DDE8F0", fg="#1F3864",
-                 anchor="w").pack(fill="x")
+        files_tab = self._tabs.add("📄  Large Files")
+        folders_tab = self._tabs.add("📁  Large Folders")
+        log_tab = self._tabs.add("📋  Scan Log")
 
-        # ── Notebook (tabs) ──
-        style = ttk.Style(self)
-        style.theme_use("clam")
-        style.configure("TNotebook", background="#F0F4F8", borderwidth=0)
-        style.configure("TNotebook.Tab", font=("Arial", 10, "bold"),
-                         padding=[12, 6], background="#BDD7EE", foreground="#1F3864")
-        style.map("TNotebook.Tab",
-                  background=[("selected", "#1F3864")],
-                  foreground=[("selected", "white")])
-
-        nb = ttk.Notebook(self)
-        nb.pack(fill="both", expand=True, padx=8, pady=8)
-
-        self._files_tab = self._build_tree_tab(
-            nb, "📄  Large Files",
-            ["#", "File Name", "Extension", "Size", "Size (MB)", "Modified", "Relative Path"],
-            [40, 260, 80, 90, 90, 135, 400]
+        self._files_tree = self._build_tree(
+            files_tab,
+            ["#", "File Name", "Extension", "Size on Disk",
+             "Size on Disk (MB)", "Modified", "Relative Path"],
+            [40, 260, 80, 110, 130, 140, 420],
         )
-        self._folders_tab = self._build_tree_tab(
-            nb, "📁  Large Folders",
-            ["#", "Folder Name", "Size", "Size (MB)", "Modified", "Relative Path"],
-            [40, 300, 90, 90, 135, 400]
+        self._folders_tree = self._build_tree(
+            folders_tab,
+            ["#", "Folder Name", "Size on Disk",
+             "Size on Disk (MB)", "Modified", "Relative Path"],
+            [40, 300, 110, 130, 140, 420],
         )
-        self._log_tab, self._log_text = self._build_log_tab(nb)
+        self._log_text = self._build_log(log_tab)
 
-        nb.add(self._files_tab, text="📄  Large Files")
-        nb.add(self._folders_tab, text="📁  Large Folders")
-        nb.add(self._log_tab, text="📋  Scan Log")
+    def _build_tree(self, parent, columns, col_widths):
+        container = ctk.CTkFrame(parent, fg_color="transparent")
+        container.pack(fill="both", expand=True, padx=2, pady=2)
+        container.rowconfigure(0, weight=1)
+        container.columnconfigure(0, weight=1)
 
-        # progress bar (hidden initially)
-        self._progress = ttk.Progressbar(self, mode="indeterminate")
-
-    def _build_tree_tab(self, parent, title, columns, col_widths):
-        frame = tk.Frame(parent, bg="#F0F4F8")
-        tree_frame = tk.Frame(frame)
-        tree_frame.pack(fill="both", expand=True, padx=4, pady=4)
-
-        style = ttk.Style()
-        style.configure("Custom.Treeview",
-                         font=("Arial", 9),
-                         rowheight=22,
-                         background="white",
-                         fieldbackground="white",
-                         foreground="#1F3864")
-        style.configure("Custom.Treeview.Heading",
-                         font=("Arial", 9, "bold"),
-                         background="#1F3864",
-                         foreground="white",
-                         relief="flat")
-        style.map("Custom.Treeview",
-                  background=[("selected", "#2E75B6")],
-                  foreground=[("selected", "white")])
-
-        tree = ttk.Treeview(tree_frame, columns=columns, show="headings",
-                            style="Custom.Treeview")
+        tree = ttk.Treeview(
+            container, columns=columns, show="headings",
+            style="Custom.Treeview",
+        )
         for col, w in zip(columns, col_widths):
             tree.heading(col, text=col,
                          command=lambda c=col, t=tree: self._sort_tree(t, c, False))
-            anchor = "e" if col in ("Size (MB)", "#") else "w"
+            anchor = "e" if col in ("Size on Disk (MB)", "#") else "w"
             tree.column(col, width=w, anchor=anchor, minwidth=30)
 
-        vsb = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
-        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=tree.xview)
+        vsb = ctk.CTkScrollbar(container, command=tree.yview)
+        hsb = ctk.CTkScrollbar(container, orientation="horizontal", command=tree.xview)
         tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
 
         tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        tree_frame.rowconfigure(0, weight=1)
-        tree_frame.columnconfigure(0, weight=1)
 
-        tree.tag_configure("odd", background="#FFFFFF")
-        tree.tag_configure("even", background="#EBF3FB")
+        tree.bind("<Button-3>", lambda e, t=tree: self._show_context_menu(e, t))
+        tree.bind("<Double-Button-1>", lambda e, t=tree: self._reveal_selected(t))
 
-        frame._tree = tree
-        return frame
+        return tree
 
-    def _build_log_tab(self, parent):
-        frame = tk.Frame(parent, bg="#1C1C1C")
-        txt = tk.Text(frame, font=("Courier New", 9), bg="#1C1C1C", fg="#A8D8A8",
-                      wrap="none", relief="flat", state="disabled")
-        sb = ttk.Scrollbar(frame, command=txt.yview)
-        txt.configure(yscrollcommand=sb.set)
-        txt.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-        return frame, txt
+    def _build_log(self, parent):
+        txt = ctk.CTkTextbox(
+            parent, font=ctk.CTkFont(family="Consolas", size=11),
+            wrap="none",
+        )
+        txt.pack(fill="both", expand=True, padx=2, pady=2)
+        txt.configure(state="disabled")
+        return txt
+
+    def _build_progress(self):
+        self._progress = ctk.CTkProgressBar(self, mode="indeterminate", height=6)
+        # Hidden initially; shown during scans via grid() / grid_remove()
+
+    def _build_statusbar(self):
+        self._status_var = tk.StringVar(value="Ready — choose a folder and click Scan.")
+        bar = ctk.CTkFrame(self, corner_radius=0, height=28,
+                           fg_color=("#E3E8EF", "#1C1F23"))
+        bar.grid(row=4, column=0, sticky="ew")
+        ctk.CTkLabel(
+            bar, textvariable=self._status_var,
+            anchor="w", font=ctk.CTkFont(size=11),
+        ).pack(fill="x", padx=16, pady=4)
+
+    # ── Theme ────────────────────────────────
+
+    def _on_theme_change(self, choice):
+        ctk.set_appearance_mode(choice.lower())
+        self._apply_tree_theme()
+
+    def _apply_tree_theme(self):
+        mode = ctk.get_appearance_mode()  # resolves "System" to "Light" or "Dark"
+        p = TREE_PALETTE.get(mode, TREE_PALETTE["Light"])
+
+        style = ttk.Style(self)
+        try:
+            style.theme_use("default")
+        except tk.TclError:
+            pass
+        style.configure(
+            "Custom.Treeview",
+            font=("Segoe UI", 10), rowheight=24,
+            background=p["bg"], fieldbackground=p["field_bg"],
+            foreground=p["fg"], borderwidth=0,
+        )
+        style.configure(
+            "Custom.Treeview.Heading",
+            font=("Segoe UI", 10, "bold"),
+            background=p["heading_bg"], foreground=p["heading_fg"],
+            relief="flat",
+        )
+        style.map(
+            "Custom.Treeview",
+            background=[("selected", p["selected_bg"])],
+            foreground=[("selected", p["selected_fg"])],
+        )
+        style.map(
+            "Custom.Treeview.Heading",
+            background=[("active", p["heading_bg"])],
+        )
+
+        for tree in (getattr(self, "_files_tree", None),
+                     getattr(self, "_folders_tree", None)):
+            if tree is not None:
+                tree.tag_configure("odd", background=p["odd"], foreground=p["fg"])
+                tree.tag_configure("even", background=p["even"], foreground=p["fg"])
 
     # ── Sorting ──────────────────────────────
 
@@ -572,6 +671,82 @@ class ScannerApp(tk.Tk):
         if path:
             self._folder_var.set(path)
 
+    # ── Reveal in file manager ───────────────
+
+    def _show_context_menu(self, event, tree):
+        iid = tree.identify_row(event.y)
+        if not iid:
+            return
+        tree.selection_set(iid)
+        tree.focus(iid)
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Show in Explorer",
+                         command=lambda: self._reveal_selected(tree))
+        menu.add_command(label="Open Containing Folder",
+                         command=lambda: self._open_parent(tree))
+        try:
+            menu.tk_popup(event.x_root, event.y_root)
+        finally:
+            menu.grab_release()
+
+    def _selected_path(self, tree):
+        sel = tree.selection()
+        if not sel:
+            return None, None
+        is_folder = tree is self._folders_tree
+        paths = self._folder_paths if is_folder else self._file_paths
+        return paths.get(sel[0]), is_folder
+
+    def _reveal_selected(self, tree):
+        path, is_folder = self._selected_path(tree)
+        if not path:
+            return
+        if not os.path.exists(path):
+            messagebox.showwarning(
+                "Path Not Found",
+                f"This path no longer exists:\n{path}",
+            )
+            return
+        self._reveal_path(path, is_folder)
+
+    def _open_parent(self, tree):
+        path, _ = self._selected_path(tree)
+        if not path:
+            return
+        parent = os.path.dirname(path)
+        if not os.path.isdir(parent):
+            messagebox.showwarning(
+                "Folder Not Found",
+                f"Parent folder no longer exists:\n{parent}",
+            )
+            return
+        self._reveal_path(parent, is_folder=True)
+
+    def _reveal_path(self, path, is_folder):
+        """Show path in the OS file manager.
+
+        Files are revealed with the item selected in the parent folder.
+        Folders are opened so their contents are visible."""
+        system = platform.system()
+        try:
+            if system == "Windows":
+                if is_folder:
+                    os.startfile(path)
+                else:
+                    subprocess.Popen(
+                        f'explorer /select,"{os.path.normpath(path)}"'
+                    )
+            elif system == "Darwin":
+                if is_folder:
+                    subprocess.Popen(["open", path])
+                else:
+                    subprocess.Popen(["open", "-R", path])
+            else:
+                target = path if is_folder else os.path.dirname(path)
+                subprocess.Popen(["xdg-open", target])
+        except Exception as e:
+            messagebox.showerror("Reveal Error", f"Could not open:\n{e}")
+
     def _start_scan(self):
         folder = self._folder_var.get().strip()
         if not folder or not os.path.isdir(folder):
@@ -582,34 +757,32 @@ class ScannerApp(tk.Tk):
             if threshold <= 0:
                 raise ValueError
         except ValueError:
-            messagebox.showerror("Invalid Threshold", "Please enter a positive number for the size threshold.")
+            messagebox.showerror("Invalid Threshold",
+                                 "Please enter a positive number for the size threshold.")
             return
 
-        # Clear previous results
-        for item in self._files_tab._tree.get_children():
-            self._files_tab._tree.delete(item)
-        for item in self._folders_tab._tree.get_children():
-            self._folders_tab._tree.delete(item)
+        for tree in (self._files_tree, self._folders_tree):
+            for item in tree.get_children():
+                tree.delete(item)
+        self._file_paths.clear()
+        self._folder_paths.clear()
         self._log_clear()
         self._large_files = []
         self._large_folders = []
-        self._export_btn.config(state="disabled")
+        self._export_btn.configure(state="disabled")
         self._stop_event.clear()
         self._scanning = True
 
-        self._scan_btn.config(state="disabled")
-        self._stop_btn.config(state="normal")
-        self._progress.pack(fill="x", padx=8, pady=(0, 4))
-        self._progress.start(12)
+        self._scan_btn.configure(state="disabled")
+        self._stop_btn.configure(state="normal")
+        self._progress.grid(row=3, column=0, sticky="ew", padx=12, pady=(0, 4))
+        self._progress.start()
         self._status("Scanning…")
 
         self._scan_start_time = datetime.now()
-        t = threading.Thread(
-            target=self._scan_worker,
-            args=(folder, threshold),
-            daemon=True,
-        )
-        t.start()
+        threading.Thread(
+            target=self._scan_worker, args=(folder, threshold), daemon=True,
+        ).start()
 
     def _scan_worker(self, folder, threshold):
         try:
@@ -629,26 +802,27 @@ class ScannerApp(tk.Tk):
         self._scan_time = elapsed
         self._scanning = False
         self._progress.stop()
-        self._progress.pack_forget()
-        self._scan_btn.config(state="normal")
-        self._stop_btn.config(state="disabled")
+        self._progress.grid_remove()
+        self._scan_btn.configure(state="normal")
+        self._stop_btn.configure(state="disabled")
 
-        # Populate trees
         for i, f in enumerate(files):
             tag = "even" if i % 2 == 0 else "odd"
-            self._files_tab._tree.insert("", "end", tags=(tag,), values=(
+            iid = self._files_tree.insert("", "end", tags=(tag,), values=(
                 i + 1, f["name"], f["extension"],
                 f["size_human"], f"{f['size_mb']:.3f}",
                 f["modified"], f["relative_path"],
             ))
+            self._file_paths[iid] = f["full_path"]
 
         for i, f in enumerate(folders):
             tag = "even" if i % 2 == 0 else "odd"
-            self._folders_tab._tree.insert("", "end", tags=(tag,), values=(
+            iid = self._folders_tree.insert("", "end", tags=(tag,), values=(
                 i + 1, f["name"],
                 f["size_human"], f"{f['size_mb']:.3f}",
                 f["modified"], f["relative_path"],
             ))
+            self._folder_paths[iid] = f["full_path"]
 
         stopped = " (scan stopped early)" if self._stop_event.is_set() else ""
         self._status(
@@ -656,22 +830,22 @@ class ScannerApp(tk.Tk):
             f"found above {threshold:.1f} MB  |  Scan time: {elapsed:.1f}s"
         )
         if files or folders:
-            self._export_btn.config(state="normal")
+            self._export_btn.configure(state="normal")
         self._log_append(f"\n✔ Scan complete. {len(files)} files, {len(folders)} folders.")
 
     def _scan_error(self, msg):
         self._scanning = False
         self._progress.stop()
-        self._progress.pack_forget()
-        self._scan_btn.config(state="normal")
-        self._stop_btn.config(state="disabled")
+        self._progress.grid_remove()
+        self._scan_btn.configure(state="normal")
+        self._stop_btn.configure(state="disabled")
         messagebox.showerror("Scan Error", f"An error occurred:\n{msg}")
         self._status("Error during scan.")
 
     def _stop_scan(self):
         self._stop_event.set()
         self._status("Stopping scan…")
-        self._stop_btn.config(state="disabled")
+        self._stop_btn.configure(state="disabled")
 
     def _export_excel(self):
         folder = self._folder_var.get().strip()
@@ -706,15 +880,15 @@ class ScannerApp(tk.Tk):
         self._status_var.set(msg)
 
     def _log_append(self, msg):
-        self._log_text.config(state="normal")
+        self._log_text.configure(state="normal")
         self._log_text.insert("end", msg + "\n")
         self._log_text.see("end")
-        self._log_text.config(state="disabled")
+        self._log_text.configure(state="disabled")
 
     def _log_clear(self):
-        self._log_text.config(state="normal")
+        self._log_text.configure(state="normal")
         self._log_text.delete("1.0", "end")
-        self._log_text.config(state="disabled")
+        self._log_text.configure(state="disabled")
 
 
 # ─────────────────────────────────────────────
